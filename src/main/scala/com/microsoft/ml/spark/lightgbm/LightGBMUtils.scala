@@ -11,12 +11,11 @@ import com.microsoft.ml.lightgbm._
 import com.microsoft.ml.spark.core.env.NativeLoader
 import com.microsoft.ml.spark.core.utils.ClusterUtil
 import com.microsoft.ml.spark.featurize.{Featurize, FeaturizeUtilities}
-import org.apache.spark.lightgbm.BlockManagerUtils
-import org.apache.spark.{SparkEnv, TaskContext}
 import org.apache.spark.ml.PipelineModel
 import org.apache.spark.ml.attribute._
 import org.apache.spark.ml.linalg.SparseVector
-import org.apache.spark.sql.{DataFrame, Dataset, Row}
+import org.apache.spark.sql.{DataFrame, Dataset}
+import org.apache.spark.{SparkEnv, TaskContext}
 import org.slf4j.Logger
 
 import scala.collection.immutable.HashSet
@@ -42,9 +41,9 @@ object LightGBMUtils {
   }
 
   def getFeaturizer(dataset: Dataset[_], labelColumn: String, featuresColumn: String,
-                    weightColumn: Option[String] = None,
-                    groupColumn: Option[String] = None,
-                    oneHotEncodeCategoricals: Boolean = true): PipelineModel = {
+    weightColumn: Option[String] = None,
+    groupColumn: Option[String] = None,
+    oneHotEncodeCategoricals: Boolean = true): PipelineModel = {
     // Create pipeline model to featurize the dataset
     val featuresToHashTo = FeaturizeUtilities.NumFeaturesTreeOrNNBased
     val featureColumns = dataset.columns.filter(col => col != labelColumn &&
@@ -66,9 +65,9 @@ object LightGBMUtils {
   }
 
   def getCategoricalIndexes(df: DataFrame,
-                            featuresCol: String,
-                            categoricalColumnIndexes: Array[Int],
-                            categoricalColumnSlotNames: Array[String]): Array[Int] = {
+    featuresCol: String,
+    categoricalColumnIndexes: Array[Int],
+    categoricalColumnSlotNames: Array[String]): Array[Int] = {
     val categoricalSlotNamesSet = HashSet(categoricalColumnSlotNames: _*)
     val featuresSchema = df.schema(featuresCol)
     val metadata = AttributeGroup.fromStructField(featuresSchema)
@@ -103,8 +102,8 @@ object LightGBMUtils {
     * @return The address and port of the driver socket.
     */
   def createDriverNodesThread(numWorkers: Int, df: DataFrame,
-                              log: Logger, timeout: Double,
-                              barrierExecutionMode: Boolean): (String, Int, Future[Unit]) = {
+    log: Logger, timeout: Double,
+    barrierExecutionMode: Boolean): (String, Int, Future[Unit]) = {
     // Start a thread and open port to listen on
     implicit val context: ExecutionContextExecutor =
       ExecutionContext.fromExecutor(Executors.newSingleThreadExecutor())
@@ -197,9 +196,11 @@ object LightGBMUtils {
   }
 
   def generateDenseDataset(numRows: Int, rowsAsDoubleArray: Array[Array[Double]],
-                           referenceDataset: Option[LightGBMDataset],
-                           featureNamesOpt: Option[Array[String]],
-                           trainParams: TrainParams): LightGBMDataset = {
+    referenceDataset: Option[LightGBMDataset],
+    featureNamesOpt: Option[Array[String]],
+    trainParams: TrainParams,
+    log: Logger): LightGBMDataset = {
+    
     val numCols = rowsAsDoubleArray.head.length
     val isRowMajor = 1
     val datasetOutPtr = lightgbmlib.voidpp_handle()
@@ -209,8 +210,10 @@ object LightGBMUtils {
     val data64bitType = lightgbmlibConstants.C_API_DTYPE_FLOAT64
     var data: Option[(SWIGTYPE_p_void, SWIGTYPE_p_double)] = None
     try {
+      log.info(s"LightGBM worker generateData from double array")
       data = Some(generateData(numRows, rowsAsDoubleArray))
       // Generate the dataset for features
+      log.info(s"LightGBM worker LGBM_DatasetCreateFromMat")
       LightGBMUtils.validate(lightgbmlib.LGBM_DatasetCreateFromMat(
         data.get._1, data64bitType,
         numRows, numCols,
@@ -230,15 +233,15 @@ object LightGBMUtils {
     * @return
     */
   def generateSparseDataset(sparseRows: Array[SparseVector],
-                            referenceDataset: Option[LightGBMDataset],
-                            featureNamesOpt: Option[Array[String]],
-                            trainParams: TrainParams): LightGBMDataset = {
+    referenceDataset: Option[LightGBMDataset],
+    featureNamesOpt: Option[Array[String]],
+    trainParams: TrainParams): LightGBMDataset = {
     val numCols = sparseRows(0).size
 
     val datasetOutPtr = lightgbmlib.voidpp_handle()
     val datasetParams = s"max_bin=${trainParams.maxBin} is_pre_partition=True " +
       (if (trainParams.categoricalFeatures.isEmpty) ""
-       else s"categorical_feature=${trainParams.categoricalFeatures.mkString(",")}")
+      else s"categorical_feature=${trainParams.categoricalFeatures.mkString(",")}")
     // Generate the dataset for features
     LightGBMUtils.validate(lightgbmlib.LGBM_DatasetCreateFromCSRSpark(
       sparseRows.asInstanceOf[Array[Object]],

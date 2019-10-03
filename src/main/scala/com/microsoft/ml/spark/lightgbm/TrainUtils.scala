@@ -8,23 +8,27 @@ import java.net._
 
 import com.microsoft.ml.lightgbm._
 import com.microsoft.ml.spark.core.env.StreamUtilities.using
+import org.apache.spark.BarrierTaskContext
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.ml.attribute._
 import org.apache.spark.ml.linalg.{DenseVector, SparseVector}
 import org.apache.spark.sql.Row
+import org.apache.spark.sql.catalyst.expressions.GenericRowWithSchema
 import org.apache.spark.sql.types.StructType
 import org.slf4j.Logger
-import org.apache.spark.BarrierTaskContext
-import org.apache.spark.sql.catalyst.expressions.GenericRowWithSchema
 
 case class NetworkParams(defaultListenPort: Int, addr: String, port: Int, barrierExecutionMode: Boolean)
+
+private object TrainingMutex {
+  val lock = new Object()
+}
 
 private object TrainUtils extends Serializable {
 
   def generateDataset(rows: Array[Row], labelColumn: String, featuresColumn: String,
-                      weightColumn: Option[String], initScoreColumn: Option[String], groupColumn: Option[String],
-                      referenceDataset: Option[LightGBMDataset], schema: StructType,
-                      log: Logger, trainParams: TrainParams): Option[LightGBMDataset] = {
+    weightColumn: Option[String], initScoreColumn: Option[String], groupColumn: Option[String],
+    referenceDataset: Option[LightGBMDataset], schema: StructType,
+    log: Logger, trainParams: TrainParams): Option[LightGBMDataset] = {
     val numRows = rows.length
     val labels = rows.map(row => row.getDouble(schema.fieldIndex(labelColumn)))
     if (trainParams.objective == LightGBMConstants.MulticlassObjective ||
@@ -69,7 +73,7 @@ private object TrainUtils extends Serializable {
         val slotNames = getSlotNames(schema, featuresColumn, numCols)
         log.info(s"LightGBM worker generating dense dataset with $numRows rows and $numCols columns")
         Some(LightGBMUtils.generateDenseDataset(numRows, rowsAsDoubleArray, referenceDataset,
-          slotNames, trainParams))
+          slotNames, trainParams, log))
       } else {
         val rowsAsSparse = rows.map(row => row.get(schema.fieldIndex(featuresColumn)) match {
           case dense: DenseVector => dense.toSparse
@@ -82,22 +86,29 @@ private object TrainUtils extends Serializable {
       }
 
     // Validate generated dataset has the correct number of rows and cols
+    log.info(s"LightGBM worker Validate generated dataset has the correct number of rows and cols")
     datasetPtr.get.validateDataset()
+    log.info(s"LightGBM worker addFloatField")
     datasetPtr.get.addFloatField(labels, "label", numRows)
     weightColumn.foreach { col =>
       val weights = rows.map(row => row.getDouble(schema.fieldIndex(col)))
+      log.info(s"LightGBM worker addFloatField $col")
       datasetPtr.get.addFloatField(weights, "weight", numRows)
     }
+    log.info(s"LightGBM worker addGroupColumn")
     addGroupColumn(rows, groupColumn, datasetPtr, numRows, schema)
     initScoreColumn.foreach { col =>
       val initScores = rows.map(row => row.getDouble(schema.fieldIndex(col)))
+      log.info(s"LightGBM worker addDoubleField $col")
       datasetPtr.get.addDoubleField(initScores, "init_score", numRows)
     }
+
+    log.info(s"LightGBM worker done generateDataset")
     datasetPtr
   }
 
   def addGroupColumn(rows: Array[Row], groupColumn: Option[String],
-                     datasetPtr: Option[LightGBMDataset], numRows: Int, schema: StructType): Unit = {
+    datasetPtr: Option[LightGBMDataset], numRows: Int, schema: StructType): Unit = {
     groupColumn.foreach { col =>
       val datatype = schema.fields(schema.fieldIndex(col)).dataType
 
@@ -136,18 +147,31 @@ private object TrainUtils extends Serializable {
   }
 
   def createBooster(trainParams: TrainParams, trainDatasetPtr: Option[LightGBMDataset],
-                    validDatasetPtr: Option[LightGBMDataset]): Option[SWIGTYPE_p_void] = {
+    validDatasetPtr: Option[LightGBMDataset], log: Logger): Option[SWIGTYPE_p_void] = {
     // Create the booster
     val boosterOutPtr = lightgbmlib.voidpp_handle()
     val parameters = trainParams.toString()
-    LightGBMUtils.validate(lightgbmlib.LGBM_BoosterCreate(trainDatasetPtr.map(_.dataset).get,
+
+    log.info("LightGBM parameters: " + parameters)
+
+    val ptr = trainDatasetPtr.map(_.dataset).get
+    log.info("LightGBM LGBM_BoosterCreate (nolock): " + ptr)
+
+    //    TrainingMutex.lock.synchronized {
+    LightGBMUtils.validate(lightgbmlib.LGBM_BoosterCreate(ptr,
       parameters, boosterOutPtr), "Booster")
+    //    }
+
     val boosterPtr = Some(lightgbmlib.voidpp_value(boosterOutPtr))
     trainParams.modelString.foreach { modelStr =>
+      log.info("LightGBM getBoosterPtrFromModelString: " + modelStr)
       val booster = LightGBMUtils.getBoosterPtrFromModelString(modelStr)
+
+      log.info("LightGBM LGBM_BoosterMerge")
       LightGBMUtils.validate(lightgbmlib.LGBM_BoosterMerge(boosterPtr.get, booster), "Booster Merge")
     }
     validDatasetPtr.foreach { lgbmdataset =>
+      log.info("LightGBM LGBM_BoosterAddValidData")
       LightGBMUtils.validate(lightgbmlib.LGBM_BoosterAddValidData(boosterPtr.get,
         lgbmdataset.dataset), "Add Validation Dataset")
     }
@@ -172,7 +196,7 @@ private object TrainUtils extends Serializable {
   }
 
   def trainCore(trainParams: TrainParams, boosterPtr: Option[SWIGTYPE_p_void],
-                log: Logger, hasValid: Boolean): Unit = {
+    log: Logger, hasValid: Boolean): Unit = {
     val isFinishedPtr = lightgbmlib.new_intp()
     var isFinished = false
     var iters = 0
@@ -252,10 +276,10 @@ private object TrainUtils extends Serializable {
   }
 
   def translate(labelColumn: String, featuresColumn: String, weightColumn: Option[String],
-                initScoreColumn: Option[String], groupColumn: Option[String],
-                validationData: Option[Broadcast[Array[Row]]],
-                log: Logger, trainParams: TrainParams, schema: StructType,
-                inputRows: Iterator[Row]): Iterator[LightGBMBooster] = {
+    initScoreColumn: Option[String], groupColumn: Option[String],
+    validationData: Option[Broadcast[Array[Row]]],
+    log: Logger, trainParams: TrainParams, schema: StructType,
+    inputRows: Iterator[Row]): Iterator[LightGBMBooster] = {
     val rows = inputRows.toArray
     var trainDatasetPtr: Option[LightGBMDataset] = None
     var validDatasetPtr: Option[LightGBMDataset] = None
@@ -269,8 +293,10 @@ private object TrainUtils extends Serializable {
       }
       var boosterPtr: Option[SWIGTYPE_p_void] = None
       try {
-        boosterPtr = createBooster(trainParams, trainDatasetPtr, validDatasetPtr)
+        boosterPtr = createBooster(trainParams, trainDatasetPtr, validDatasetPtr, log)
+        log.info("LightGBM begin trainCore")
         trainCore(trainParams, boosterPtr, log, validDatasetPtr.isDefined)
+        log.info("LightGBM save booster to string")
         val model = saveBoosterToString(boosterPtr, log)
         List[LightGBMBooster](new LightGBMBooster(model)).toIterator
       } finally {
@@ -310,7 +336,7 @@ private object TrainUtils extends Serializable {
   }
 
   def setFinishedStatus(networkParams: NetworkParams,
-                        localListenPort: Int, log: Logger): Unit = {
+    localListenPort: Int, log: Logger): Unit = {
     using(new Socket(networkParams.addr, networkParams.port)) {
       driverSocket =>
         using(new BufferedWriter(new OutputStreamWriter(driverSocket.getOutputStream))) {
@@ -324,8 +350,8 @@ private object TrainUtils extends Serializable {
   }
 
   def getNetworkInitNodes(networkParams: NetworkParams,
-                          localListenPort: Int, log: Logger,
-                          emptyPartition: Boolean): String = {
+    localListenPort: Int, log: Logger,
+    emptyPartition: Boolean): String = {
     using(new Socket(networkParams.addr, networkParams.port)) {
       driverSocket =>
         using(Seq(new BufferedReader(new InputStreamReader(driverSocket.getInputStream)),
@@ -385,10 +411,10 @@ private object TrainUtils extends Serializable {
   }
 
   def trainLightGBM(networkParams: NetworkParams, labelColumn: String, featuresColumn: String,
-                    weightColumn: Option[String], initScoreColumn: Option[String], groupColumn: Option[String],
-                    validationData: Option[Broadcast[Array[Row]]], log: Logger,
-                    trainParams: TrainParams, numCoresPerExec: Int, schema: StructType)
-                   (inputRows: Iterator[Row]): Iterator[LightGBMBooster] = {
+    weightColumn: Option[String], initScoreColumn: Option[String], groupColumn: Option[String],
+    validationData: Option[Broadcast[Array[Row]]], log: Logger,
+    trainParams: TrainParams, numCoresPerExec: Int, schema: StructType)
+    (inputRows: Iterator[Row]): Iterator[LightGBMBooster] = {
     val emptyPartition = !inputRows.hasNext
     // Ideally we would start the socket connections in the C layer, this opens us up for
     // race conditions in case other applications open sockets on cluster, but usually this
