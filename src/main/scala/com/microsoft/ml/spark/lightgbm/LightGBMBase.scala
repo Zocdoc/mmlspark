@@ -4,19 +4,16 @@
 package com.microsoft.ml.spark.lightgbm
 
 import com.microsoft.ml.spark.core.utils.ClusterUtil
+import org.apache.spark.ml.linalg.SQLDataTypes.VectorType
+import org.apache.spark.ml.param.shared.{HasFeaturesCol => HasFeaturesColSpark, HasLabelCol => HasLabelColSpark}
 import org.apache.spark.ml.{Estimator, Model}
-import org.apache.spark.sql.{Column, DataFrame, Dataset, Encoders}
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.{DataFrame, Dataset, Encoders}
 
 import scala.concurrent.Await
 import scala.concurrent.duration.{Duration, SECONDS}
-import scala.math.min
-import org.apache.spark.ml.param.shared.{HasFeaturesCol => HasFeaturesColSpark, HasLabelCol => HasLabelColSpark}
-import org.apache.spark.sql.functions._
-import org.apache.spark.sql.types.{BooleanType, DataType, DoubleType, IntegerType, NumericType, StringType}
-import org.apache.spark.ml.linalg.SQLDataTypes.VectorType
-
-import scala.collection.mutable.ListBuffer
 import scala.language.existentials
+import scala.math.min
 
 trait LightGBMBase[TrainedModel <: Model[TrainedModel]] extends Estimator[TrainedModel]
   with LightGBMParams with HasFeaturesColSpark with HasLabelColSpark {
@@ -41,18 +38,25 @@ trait LightGBMBase[TrainedModel <: Model[TrainedModel]] extends Estimator[Traine
     }
   }
 
-  protected def castColumns(dataset: Dataset[_], trainingCols: Array[(String, DataType)]): DataFrame = {
+  protected def castColumns(dataset: Dataset[_], trainingCols: Array[(String, Seq[DataType])]): DataFrame = {
     val schema = dataset.schema
     // Cast columns to correct types
     dataset.select(
       trainingCols.map {
-        case (name, datatype) => {
+        case (name, datatypes: Seq[DataType]) => {
           val index = schema.fieldIndex(name)
           // Note: We only want to cast if original column was of numeric type
+
           schema.fields(index).dataType match {
             case numericDataType: NumericType =>
-              if (numericDataType != datatype) dataset(name).cast(datatype)
-              else dataset(name)
+              // If more than one datatype is allowed, see if any match
+              if (datatypes.contains(numericDataType)) {
+                dataset(name)
+              } else {
+                // If none match, cast to the first option
+                dataset(name).cast(datatypes.head)
+              }
+
             case _ => dataset(name)
           }
         }
@@ -60,7 +64,7 @@ trait LightGBMBase[TrainedModel <: Model[TrainedModel]] extends Estimator[Traine
     ).toDF()
   }
 
-  protected def prepareDataframe(dataset: Dataset[_], trainingCols: Array[(String, DataType)],
+  protected def prepareDataframe(dataset: Dataset[_], trainingCols: Array[(String, Seq[DataType])],
                                  numWorkers: Int): DataFrame = {
     val df = castColumns(dataset, trainingCols)
     // Reduce number of partitions to number of executor cores
@@ -98,14 +102,19 @@ trait LightGBMBase[TrainedModel <: Model[TrainedModel]] extends Estimator[Traine
     }
   }
 
-  protected def getTrainingCols(): Array[(String, DataType)] = {
-    val colsToCheck = Array((Some(getLabelCol), DoubleType), (Some(getFeaturesCol), VectorType),
-      (get(weightCol), DoubleType),
-      (getOptGroupCol, IntegerType), (get(validationIndicatorCol), BooleanType),
-      (get(initScoreCol), DoubleType))
-    colsToCheck.flatMap { case (col: Option[String], colType: DataType) => {
+  protected def getTrainingCols(): Array[(String, Seq[DataType])] = {
+    val colsToCheck: Array[(Option[String], Seq[DataType])] = Array(
+      (Some(getLabelCol), Seq(DoubleType)),
+      (Some(getFeaturesCol), Seq(VectorType)),
+      (get(weightCol), Seq(DoubleType)),
+      (getOptGroupCol, Seq(IntegerType, LongType, StringType)),
+      (get(validationIndicatorCol), Seq(BooleanType)),
+      (get(initScoreCol), Seq(DoubleType)))
+
+    colsToCheck.flatMap { case (col: Option[String], colType: Seq[DataType]) => {
       if (col.isDefined) Some(col.get, colType) else None
-    }}
+    }
+    }
   }
 
   protected def innerTrain(dataset: Dataset[_]): TrainedModel = {
@@ -133,11 +142,13 @@ trait LightGBMBase[TrainedModel <: Model[TrainedModel]] extends Estimator[Traine
     val trainParams = getTrainParams(numWorkers, categoricalIndexes, dataset)
     log.info(s"LightGBM parameters: ${trainParams.toString()}")
     val networkParams = NetworkParams(getDefaultListenPort, inetAddress, port, getUseBarrierExecutionMode)
-    val validationData =
+    val (trainingData, validationData) =
       if (get(validationIndicatorCol).isDefined && dataset.columns.contains(getValidationIndicatorCol))
-        Some(sc.broadcast(df.filter(x => x.getBoolean(x.fieldIndex(getValidationIndicatorCol))).collect()))
-      else None
-    val preprocessedDF = preprocessData(df)
+        (df.filter(x => !x.getBoolean(x.fieldIndex(getValidationIndicatorCol))),
+          Some(sc.broadcast(preprocessData(df.filter(x =>
+            x.getBoolean(x.fieldIndex(getValidationIndicatorCol)))).collect())))
+      else (df, None)
+    val preprocessedDF = preprocessData(trainingData)
     val schema = preprocessedDF.schema
     val mapPartitionsFunc = TrainUtils.trainLightGBM(networkParams, getLabelCol, getFeaturesCol,
       get(weightCol), get(initScoreCol), getOptGroupCol, validationData, log, trainParams, numCoresPerExec, schema)(_)

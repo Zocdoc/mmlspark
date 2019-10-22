@@ -31,36 +31,6 @@ private object TrainUtils extends Serializable {
     log: Logger, trainParams: TrainParams): Option[LightGBMDataset] = {
     val numRows = rows.length
     val labels = rows.map(row => row.getDouble(schema.fieldIndex(labelColumn)))
-    if (trainParams.objective == LightGBMConstants.MulticlassObjective ||
-      trainParams.objective == LightGBMConstants.BinaryObjective) {
-      val distinctLabels = labels.distinct.map(_.toInt).sorted
-      // TODO: Temporary hack to append missing labels for debugging, off by default
-      //  try to figure out a better fix in lightgbm
-      if (trainParams.asInstanceOf[ClassifierTrainParams].generateMissingLabels) {
-        val (_, missingLabels) =
-          distinctLabels.foldLeft((-1, List[Int]())) {
-            case ((baseCount, baseLabels), newLabel) => {
-              if (newLabel == baseCount + 1) (newLabel, baseLabels)
-              else (baseCount + 1, baseCount + 1 :: baseLabels)
-            }
-          }
-        if (missingLabels.nonEmpty) {
-          // Append missing labels to rows
-          val newRows = rows.take(missingLabels.size).zip(missingLabels).map { case (row, label) =>
-            val rowAsArray = row.toSeq.toArray
-            rowAsArray.update(schema.fieldIndex(labelColumn), label.toDouble)
-            new GenericRowWithSchema(rowAsArray, row.schema)
-          }
-          return generateDataset(rows ++ newRows, labelColumn, featuresColumn, weightColumn, initScoreColumn,
-            groupColumn, referenceDataset, schema, log, trainParams)
-        }
-      } else {
-        val errMsg = "For classification, label values must start from 0 and increase " +
-          "by 1 to n for each partition."
-        distinctLabels.foldLeft(-1)((base, newLabel) => if (newLabel == base + 1) newLabel else
-          throw new Exception(s"$errMsg  Missing label ${base + 1}, unique labels ${distinctLabels.mkString(",")}"))
-      }
-    }
     val hrow = rows.head
     var datasetPtr: Option[LightGBMDataset] = None
     datasetPtr =
@@ -107,43 +77,70 @@ private object TrainUtils extends Serializable {
     datasetPtr
   }
 
+  trait CardinalityType[T]
+
+  object CardinalityTypes {
+
+    implicit object LongType extends CardinalityType[Long]
+
+    implicit object IntType extends CardinalityType[Int]
+
+    implicit object StringType extends CardinalityType[String]
+
+  }
+
+  import CardinalityTypes._
+
   def addGroupColumn(rows: Array[Row], groupColumn: Option[String],
     datasetPtr: Option[LightGBMDataset], numRows: Int, schema: StructType): Unit = {
     groupColumn.foreach { col =>
       val datatype = schema.fields(schema.fieldIndex(col)).dataType
 
       if (datatype != org.apache.spark.sql.types.IntegerType
-        && datatype != org.apache.spark.sql.types.LongType) {
-        throw new IllegalArgumentException(s"group column $col must be of type Long or Int but is ${datatype.typeName}")
+        && datatype != org.apache.spark.sql.types.LongType
+        && datatype != org.apache.spark.sql.types.StringType) {
+        throw new IllegalArgumentException(
+          s"group column $col must be of type Long, Int or String but is ${datatype.typeName}")
       }
 
-      val group =
-        if (datatype == org.apache.spark.sql.types.IntegerType) {
-          rows.map(row => row.getInt(schema.fieldIndex(col)))
-        } else {
-          rows.map(row => row.getLong(schema.fieldIndex(col)).toInt)
-        }
+      val colIdx = schema.fieldIndex(col)
 
       // Convert to distinct count (note ranker should have sorted within partition by group id)
       // We use a triplet of a list of cardinalities, last unqiue value and unique value count
-      val cardinalityTriplet =
-      group.foldLeft((List.empty[Int], -1, 0)) { (listValue, currentValue) =>
-        if (listValue._2 < 0) {
+      val groupCardinality = datatype match {
+        case org.apache.spark.sql.types.IntegerType => countCardinality(rows.map(row => row.getInt(colIdx)))
+        case org.apache.spark.sql.types.LongType => countCardinality(rows.map(row => row.getLong(colIdx)))
+        case org.apache.spark.sql.types.StringType => countCardinality(rows.map(row => row.getString(colIdx)))
+      }
+
+      datasetPtr.get.addIntField(groupCardinality, "group", groupCardinality.length)
+    }
+  }
+
+  case class CardinalityTriplet[T](groupCounts: List[Int], currentValue: T, currentCount: Int)
+
+  def countCardinality[T](input: Seq[T])(implicit ev: CardinalityType[T]): Array[Int] = {
+    val default: T = null.asInstanceOf[T]
+
+    val cardinalityTriplet = input.foldLeft(CardinalityTriplet(List.empty[Int], default, 0)) {
+      case (listValue: CardinalityTriplet[T], currentValue) =>
+
+        if (listValue.groupCounts.isEmpty && listValue.currentCount == 0) {
           // Base case, keep list as empty and set cardinality to 1
-          (listValue._1, currentValue, 1)
+          CardinalityTriplet(listValue.groupCounts, currentValue, 1)
         }
-        else if (listValue._2 == currentValue) {
+        else if (listValue.currentValue == currentValue) {
           // Encountered same value
-          (listValue._1, currentValue, listValue._3 + 1)
+          CardinalityTriplet(listValue.groupCounts, currentValue, listValue.currentCount + 1)
         }
         else {
           // New value, need to reset counter and add new cardinality to list
-          (listValue._3 :: listValue._1, currentValue, 1)
+          CardinalityTriplet(listValue.currentCount :: listValue.groupCounts, currentValue, 1)
         }
-      }
-      val groupCardinality = (cardinalityTriplet._3 :: cardinalityTriplet._1).reverse.toArray
-      datasetPtr.get.addIntField(groupCardinality, "group", groupCardinality.length)
     }
+
+    val groupCardinality = (cardinalityTriplet.currentCount :: cardinalityTriplet.groupCounts).reverse.toArray
+    groupCardinality
   }
 
   def createBooster(trainParams: TrainParams, trainDatasetPtr: Option[LightGBMDataset],
