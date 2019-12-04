@@ -188,7 +188,13 @@ object LightGBMUtils {
   def generateData(numRows: Int, rowsAsDoubleArray: Array[Array[Double]]):
   (SWIGTYPE_p_void, SWIGTYPE_p_double) = {
     val numCols = rowsAsDoubleArray.head.length
-    val data = lightgbmlib.new_doubleArray(numCols * numRows)
+
+    val size: Double = numCols * numRows.toDouble
+    if (size > Int.MaxValue) {
+      throw new IllegalArgumentException(s"numCols * numRows exceed IntMax. rows: $numRows cols: $numCols")
+    }
+
+    val data = lightgbmlib.new_doubleArray(size.toInt)
     rowsAsDoubleArray.zipWithIndex.foreach(ri =>
       ri._1.zipWithIndex.foreach(value =>
         lightgbmlib.doubleArray_setitem(data, value._2 + (ri._2 * numCols), value._1)))
