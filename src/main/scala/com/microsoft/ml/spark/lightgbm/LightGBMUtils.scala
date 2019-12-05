@@ -41,9 +41,9 @@ object LightGBMUtils {
   }
 
   def getFeaturizer(dataset: Dataset[_], labelColumn: String, featuresColumn: String,
-    weightColumn: Option[String] = None,
-    groupColumn: Option[String] = None,
-    oneHotEncodeCategoricals: Boolean = true): PipelineModel = {
+                    weightColumn: Option[String] = None,
+                    groupColumn: Option[String] = None,
+                    oneHotEncodeCategoricals: Boolean = true): PipelineModel = {
     // Create pipeline model to featurize the dataset
     val featuresToHashTo = FeaturizeUtilities.NumFeaturesTreeOrNNBased
     val featureColumns = dataset.columns.filter(col => col != labelColumn &&
@@ -65,9 +65,9 @@ object LightGBMUtils {
   }
 
   def getCategoricalIndexes(df: DataFrame,
-    featuresCol: String,
-    categoricalColumnIndexes: Array[Int],
-    categoricalColumnSlotNames: Array[String]): Array[Int] = {
+                            featuresCol: String,
+                            categoricalColumnIndexes: Array[Int],
+                            categoricalColumnSlotNames: Array[String]): Array[Int] = {
     val categoricalSlotNamesSet = HashSet(categoricalColumnSlotNames: _*)
     val featuresSchema = df.schema(featuresCol)
     val metadata = AttributeGroup.fromStructField(featuresSchema)
@@ -102,8 +102,8 @@ object LightGBMUtils {
     * @return The address and port of the driver socket.
     */
   def createDriverNodesThread(numWorkers: Int, df: DataFrame,
-    log: Logger, timeout: Double,
-    barrierExecutionMode: Boolean): (String, Int, Future[Unit]) = {
+                              log: Logger, timeout: Double,
+                              barrierExecutionMode: Boolean): (String, Int, Future[Unit]) = {
     // Start a thread and open port to listen on
     implicit val context: ExecutionContextExecutor =
       ExecutionContext.fromExecutor(Executors.newSingleThreadExecutor())
@@ -187,26 +187,22 @@ object LightGBMUtils {
 
   def generateData(numRows: Int, rowsAsDoubleArray: Array[Array[Double]]):
   (SWIGTYPE_p_void, SWIGTYPE_p_double) = {
-    val numCols = rowsAsDoubleArray.head.length
+    val numCols: Long = rowsAsDoubleArray.head.length
+    val size: Long = numCols * numRows.toLong
 
-    val size: Double = numCols * numRows.toDouble
-    if (size > Int.MaxValue) {
-      throw new IllegalArgumentException(s"numCols * numRows exceed IntMax. rows: $numRows cols: $numCols")
-    }
-
-    val data = lightgbmlib.new_doubleArray(size.toInt)
+    val data = lightgbmlib.new_doubleArray_2(size)
     rowsAsDoubleArray.zipWithIndex.foreach(ri =>
       ri._1.zipWithIndex.foreach(value =>
-        lightgbmlib.doubleArray_setitem(data, value._2 + (ri._2 * numCols), value._1)))
+        lightgbmlib.doubleArray_setitem_2(data, value._2.toLong + (ri._2.toLong * numCols), value._1)))
     (lightgbmlib.double_to_voidp_ptr(data), data)
   }
 
   def generateDenseDataset(numRows: Int, rowsAsDoubleArray: Array[Array[Double]],
-    referenceDataset: Option[LightGBMDataset],
-    featureNamesOpt: Option[Array[String]],
-    trainParams: TrainParams,
-    log: Logger): LightGBMDataset = {
-    
+                           referenceDataset: Option[LightGBMDataset],
+                           featureNamesOpt: Option[Array[String]],
+                           trainParams: TrainParams,
+                           log: Logger): LightGBMDataset = {
+
     val numCols = rowsAsDoubleArray.head.length
     val isRowMajor = 1
     val datasetOutPtr = lightgbmlib.voidpp_handle()
@@ -239,9 +235,9 @@ object LightGBMUtils {
     * @return
     */
   def generateSparseDataset(sparseRows: Array[SparseVector],
-    referenceDataset: Option[LightGBMDataset],
-    featureNamesOpt: Option[Array[String]],
-    trainParams: TrainParams): LightGBMDataset = {
+                            referenceDataset: Option[LightGBMDataset],
+                            featureNamesOpt: Option[Array[String]],
+                            trainParams: TrainParams): LightGBMDataset = {
     val numCols = sparseRows(0).size
 
     val datasetOutPtr = lightgbmlib.voidpp_handle()
